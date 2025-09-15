@@ -1,0 +1,34 @@
+model:
+  type: neural_network
+  architecture:
+    layers:
+      - type: Dense
+        units: 128
+        activation: relu
+      - type: Dropout
+        rate: 0.2
+      - type: Dense
+        units: 64
+        activation: relu
+      - type: Dense
+        units: 1
+        activation: sigmoid
+  optimizer: adam
+  loss_function: binary_crossentropy
+  metrics:
+    - accuracy
+
+training:
+  batch_size: 32
+  epochs: 50
+  validation_split: 0.2
+  early_stopping:
+    patience: 5
+
+data:
+  input_path: "data/user_events.csv"
+  output_path: "models/uba_model_weights.h5"
+
+logging:
+  level: INFO
+  log_file: "logs/uba_training.log"
