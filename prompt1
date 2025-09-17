@@ -1,0 +1,336 @@
+при работе системы pam собираются логи событий на сервере: время аутентификации, ip пользователя, host ip,  учетная запись под которой производилось подключение, ssh команда, результаты работы правил обработки команд. нужно написать UBA систему которая будет строить модель профиля пользователя по накопленным данным и оценивать риск при вводе новой команды
+
+Отлично — делаю готовое практическое руководство + пример реализации UBA (User Behaviour Analytics) для ваших PAM-логов: как строить профиль пользователя по накопленным данным и как оценивать риск при вводе новой SSH/команды. Без вопросов — даю архитектуру, набор фич, алгоритмы, метрики и готовые фрагменты кода/псевдокода, которые вы можете запустить и адаптировать.
+
+1. Краткая задача
+
+Имеем PAM/SSH логи (строки с полями): время аутентификации, IP пользователя (client IP), host IP (сервер), учётная запись (user), ssh команда (строка команды), результаты обработки правил (exit code, правило matched).
+Цель: для каждого пользователя автоматически строить профиль поведения и при появлении новой команды в реальном сеансе оценивать риск аномалии (score) и дать объяснение/флаг.
+
+2. Общая архитектура системы
+
+Ingest: сбор логов в хранилище (Kafka → ETL → ClickHouse/Elasticsearch/Postgres).
+
+Feature store: агрегированные признаки по пользователю/сессии/команде (Redis or feature DB).
+
+Model training: периодическое обучение моделей (offline batch).
+
+Real-time scoring: при вводе команды — извлечь фичи и сделать предсказание (REST/gRPC).
+
+Alerting & feedback: правила + риск → тикет/ops + ручная валидация, обратная связь в модель.
+
+Monitoring & drift detection: метрики качества, смена поведения → переобучение.
+
+3. Какие сущности и уровни профилей
+
+Event (единичная запись): timestamp, src_ip, dst_ip, user, command_text, exit_code, rule_match.
+
+Session: привязка по ssh connection id (если есть) или по user+src_ip+timespan.
+
+User profile: агрегаты по последним N дней (посещение хостов, команды, время активности, IP set, команда-ngrams).
+
+Host profile: часто используемые пользователями, профили приложений.
+
+Command profile: частота/контекст выполнения конкретных команд.
+
+4. Важные признаки (features)
+
+Разделяю на моментальные (для события) и агрегированные/контекстные.
+
+Моментальные (event-level)
+
+hour_of_day, day_of_week
+
+command_length, first_token (cmd name), n_tokens
+
+is_interactive (есть ли bash -i / sudo -s)
+
+ssh_flags / tty present
+
+src_ip гео/ASN (country, ASN) — если доступны
+
+dst_host (имя/тип)
+
+Контекстные / агрегированные (по user/session/history)
+
+freq_user_cmd(command) — частота этой команды для пользователя за window (последние 30/90 дней)
+
+freq_user_host(host) — как часто пользователь логинится на этот хост
+
+avg_exec_result (успех/ошибки) по user
+
+time_since_last_session (в минутах)
+
+num_unique_src_ips за window
+
+entropy команд (насколько разнообразны команды пользователя)
+
+TF-IDF / embedding команды (n-gram или transformer embedding)
+
+sequence features: последние K команд (как sequence)
+
+one-hot/embedding для user, host, src_ip (или hashing trick)
+
+Правила/сигнатуры (для гибридной системы)
+
+командная сигнатура: попытка запуска netcat/ssh/scp/cron/iptables/ps/killall
+
+попытки повышения привилегий: sudo, su
+
+доступ к чувствительным путям: /etc/shadow, /root/
+
+запуск скриптов с base64/decode/pipe в sh
+
+5. Подходы к моделям (рекомендации)
+
+Выбор методов зависит от доступности «чистых» меток аномалий.
+
+A. Unsupervised / Anomaly Detection (рекомендуется как база)
+
+Isolation Forest — быстрый, пригоден для табличных признаков.
+
+One-Class SVM — если признаки стандартизованы (медленнее).
+
+Autoencoder (dense) — хорошо для реконструкции векторных признаков; аномалия = высокая ошибка реконструкции.
+
+Sequence Autoencoder / LSTM-AE — учитывает порядок команд (для последовательностей последующих команд).
+
+HMM — если поведение хорошо моделируется скрытой последовательностью состояний.
+
+B. Supervised (если есть метки)
+
+Gradient Boosted Trees (XGBoost/LightGBM) — на табличных фичах, если есть исторические инциденты.
+
+Sequence models (Transformer/LSTM) — если метки для последовательностей.
+
+C. Hybrid (правила + ML)
+
+Правила покрывают известные опасные паттерны, ML — находить неизвестные аномалии.
+
+6. Пример pipeline: от логов до риска (концепт)
+
+Парсинг логов → нормализация поля command (токенизация, удаление аргументов типа временных меток, индексация путей).
+
+Feature extraction за текущий сеанс + lookup в feature store (история пользователя).
+
+Compute anomaly score:
+
+score_ml = model.predict_proba(features) или anomaly_score = -model.decision_function(...)
+
+rule_score = max(critical_rule_matched ? 1.0 : 0) (0 или 1)
+
+final_risk = sigmoid( w1*normalized(score_ml) + w2*rule_score + w3*rare_host_flag + ... )
+
+Thresholding / Triage:
+
+final_risk > 0.9 — immediate block / require MFA / drop connection
+
+0.5 < final_risk <= 0.9 — alert to SOC, require confirmation
+
+<0.5 — log/monitor
+
+7. Критерии и метрики оценки
+
+Precision@K, Recall@K для инцидентов.
+
+ROC AUC (если есть метки).
+
+Time to detect, false positive rate (важно — SOC устает от FP).
+
+Drift detection: изменение распределения входных фич → автоматический ре-трейн.
+
+8. Детализированный пример реализации в Python (скелет)
+
+Ниже — компактный пример подготовки фич, обучения IsolationForest и функции score_event. (Псевдокод/выполнимый Python — нужно адаптировать под ваш формат логов.)
+
+# Пример: Python (используйте pandas, sklearn)
+import re
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import IsolationForest
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import StandardScaler
+import joblib
+from datetime import datetime, timedelta
+
+# 1) Парсер события (строка -> dict)
+def parse_event(row):
+    # row: dict or DataFrame row with fields: ts, src_ip, dst_host, user, command, exit_code
+    ts = pd.to_datetime(row['ts'])
+    cmd = row['command'] or ""
+    first_token = cmd.strip().split()[0] if len(cmd.strip())>0 else ""
+    return {
+        'ts': ts,
+        'hour': ts.hour,
+        'dow': ts.dayofweek,
+        'src_ip': row['src_ip'],
+        'dst_host': row['dst_host'],
+        'user': row['user'],
+        'cmd_text': cmd,
+        'first_token': first_token,
+        'cmd_len': len(cmd),
+        'exit_code': row.get('exit_code', 0),
+    }
+
+# 2) Построение признаков: TF-IDF для команд + табличные
+def build_features(df_events, user_history_agg):
+    # df_events: DataFrame of recent events (batch)
+    # user_history_agg: precomputed per-user aggregates (dict or DataFrame)
+    # TF-IDF over command text
+    tf = TfidfVectorizer(ngram_range=(1,2), max_features=1024, analyzer='word')
+    cmd_tfidf = tf.fit_transform(df_events['cmd_text'].fillna(''))
+    cmd_df = pd.DataFrame(cmd_tfidf.toarray(), index=df_events.index,
+                          columns=[f"tfidf_{i}" for i in range(cmd_tfidf.shape[1])])
+    df = pd.concat([df_events.reset_index(drop=True), cmd_df.reset_index(drop=True)], axis=1)
+    # add user aggregates
+    df['user_cmd_freq'] = df.apply(lambda r: user_history_agg.get((r['user'], r['cmd_text']), 0), axis=1)
+    df['user_host_freq'] = df['user'].apply(lambda u: user_history_agg.get((u, 'host_count'), 0))
+    # time features already present hour, dow
+    # encode first_token via hashing (simple)
+    df['first_token_hash'] = df['first_token'].apply(lambda s: hash(s) % 1000)
+    # select numeric features
+    feature_cols = ['hour','dow','cmd_len','exit_code','user_cmd_freq','user_host_freq','first_token_hash'] + list(cmd_df.columns)
+    return df, feature_cols, tf
+
+# 3) Обучение модели (IsolationForest)
+def train_model(feature_matrix):
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(feature_matrix)
+    model = IsolationForest(n_estimators=200, contamination='auto', random_state=42)
+    model.fit(Xs)
+    return model, scaler
+
+# 4) Scoring function for single new event
+def score_event(event_row, model, scaler, tf, user_history_agg):
+    ev = parse_event(event_row)
+    df_ev = pd.DataFrame([ev])
+    # build tfidf with existing vectorizer
+    cmd_vec = tf.transform(df_ev['cmd_text'].fillna(''))
+    cmd_df = pd.DataFrame(cmd_vec.toarray(), columns=[f"tfidf_{i}" for i in range(cmd_vec.shape[1])])
+    df = pd.concat([df_ev.reset_index(drop=True), cmd_df.reset_index(drop=True)], axis=1)
+    df['user_cmd_freq'] = df.apply(lambda r: user_history_agg.get((r['user'], r['cmd_text']), 0), axis=1)
+    df['user_host_freq'] = df['user'].apply(lambda u: user_history_agg.get((u, 'host_count'), 0))
+    df['first_token_hash'] = df['first_token'].apply(lambda s: hash(s) % 1000)
+    feature_cols = ['hour','dow','cmd_len','exit_code','user_cmd_freq','user_host_freq','first_token_hash'] + list(cmd_df.columns)
+    X = df[feature_cols].fillna(0).values
+    Xs = scaler.transform(X)
+    score = -model.decision_function(Xs)[0]  # higher -> more anomalous
+    # normalize score to [0,1]
+    risk_ml = 1 / (1 + np.exp(- (score - 0.0)))  # sigmoid shift as example
+    # simple rule boost
+    risky_rules = ['nc ', 'ncat', 'curl .*pipe', 'wget .*pipe', 'base64 -d', 'sudo su', 'passwd --stdin']
+    rule_hit = 1.0 if any(re.search(pat, event_row['command'] or '', re.IGNORECASE) for pat in risky_rules) else 0.0
+    final_risk = 0.7 * risk_ml + 0.3 * rule_hit
+    return {'ml_score': float(risk_ml), 'rule_hit': bool(rule_hit), 'final_risk': float(final_risk)}
+
+
+Примечания:
+
+В реальном варианте TF-IDF нужно обучать на большой коллекции команд; можно использовать эмбеддинги (SBERT) для семантики.
+
+Для sequence-моделей храните последние K команд в feature store и подавайте в LSTM/Transformer.
+
+9. Обработка последовательностей (если нужен контекст)
+
+Если поведение зависит от порядка команд, используйте:
+
+LSTM autoencoder: вход — последовательность векторов команд (эмбеддинги + метафичи), аномалия = высокий рекр.ошибка.
+
+Transformer classifier: на метках “normal/anomalous”.
+
+Sliding window: посчитать аномалию для окна из последних 10 команд.
+
+10. Интерпретируемость (важно для SOC)
+
+Возвращайте вместе со скором топ-5 фич, которые дали вклад (SHAP для деревьев или метрики важности).
+
+Log explainers: “команда неизвестна пользователю (freq=0)”, “выполнена в необычное время (03:00)”, “src_ip из другой страны”.
+
+11. Практические советы по запуску
+
+Start simple: build IsolationForest on aggregated features + TF-IDF.
+
+Combine with high-fidelity rules for critical actions (sudo, passwd, access to /etc).
+
+Calibrate thresholds on historical data (choose FP budget).
+
+Allow human in the loop: пометка “false positive” → сохранять для retraining.
+
+Rate limiting alerts: группировать события по сессии.
+
+Псевдонимы команд: нормализуйте scp user@host:/path → scp.
+
+Маскирование чувствительных данных (GDPR): храните хэши путей/пар.
+
+Обеспечьте защита модели и feature store (доступ, аудит).
+
+12. Пример risk scoring strategy (формула)
+
+Нормализованный ML-анализатор: r_ml ∈ [0,1] (больше = необычно).
+
+Правила: r_rule ∈ {0, 1} (можно сделать graded с severity).
+
+Контекст: r_context — бонус за редкий IP/host/time (0..1).
+
+Итог: risk = clamp( α*r_ml + β*r_rule + γ*r_context , 0, 1 )
+Рекомендация: α=0.6, β=0.3, γ=0.1 (настраивается).
+
+13. Как тестировать/оценивать
+
+Создайте тест-набор из исторических сессий и inject* известных атак (simulated).
+
+Метрики: precision at top 100 alerts, avg alerts per day per 1000 users.
+
+A/B: сравните pure rules vs hybrid ML+rules.
+
+14. Обеспечение производительности (real-time)
+
+Feature store в Redis/Memcached для быстрых lookups.
+
+Модель как microservice (FastAPI/Flask + gunicorn + batching).
+
+Вынесите тяжелые эмбеддинги в предварительно вычисляемые представления.
+
+Латентность scoring: цель <100–200ms для UX.
+
+15. Безопасность и приватность
+
+Сохраняйте минимальные поля — хешируйте/маскируйте чувствительную часть команд.
+
+Контролируйте доступ к моделям/логам.
+
+Логи и модели — под аудит и версиями (MLflow).
+
+16. Roadmap внедрения (пошагово)
+
+Сбор и нормализация логов, ETL в DB.
+
+Простая TF-IDF + IsolationForest, offline evaluation.
+
+Rules engine + hybrid scoring.
+
+Add sequence model (LSTM) если много false negatives.
+
+Add explainability (SHAP), dashboards (Kibana/Grafana).
+
+Feedback loop + automatic retrain.
+
+17. Что можно улучшать дальше
+
+Персональные профили на уровне роли/команды (не только user).
+
+Использование pretrained code/command embeddings.
+
+Контекст приложений (какие процессы запускают команды).
+
+Threat intelligence lookups (командные шаблоны известных атак).
+
+Если хотите, могу прямо сейчас:
+
+подготовить готовый notebook с реализацией выше (парсинг → фичи → обучение IsolationForest → API scoring) на Python (pandas, scikit-learn), или
+
+сгенерировать конфиг архитектуры (Kafka topics, schemas, example SQL для feature store), или
+
+написать FastAPI сервис для real-time scoring со всеми шагами.
+
+Скажи, что предпочитаете — и я за пару сообщений дам полноценный код/ноутбук и пример данных (генератор синтетических логов) для теста.
